@@ -20,10 +20,21 @@ class KNKDataset(Dataset):
         self.data = []
         
         # Load the JSONL file
+        print(f"Loading dataset from {jsonl_path}")
         with open(jsonl_path, 'r') as f:
-            for line in f:
-                entry = json.loads(line.strip())
-                self.data.append(entry)
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:  # Skip empty lines
+                    continue
+                try:
+                    entry = json.loads(line)
+                    self.data.append(entry)
+                except json.JSONDecodeError as e:
+                    print(f"Error parsing line {line_num}: {e}")
+                    print(f"Line content: {line[:100]}...")
+                    if line_num <= 5:  # Show first few problematic lines
+                        print(f"Full line: {line}")
+                    continue
         
         # Split data into train/val
         n_train = int(len(self.data) * train_ratio)
@@ -150,22 +161,46 @@ class WandbTrainer(Trainer):
 
 
 def main():
-    # Configuration - all hardcoded
-    dataset_path = Path('data/n_2.jsonl')
-    max_length = 1024
-    batch_size = 128
-    learning_rate = 1e-4
-    n_epochs = 50
+    import sys
     
-    n_layer = 12
-    n_head = 12
-    n_embd = 768
+    # Check for --no-wandb flag
+    use_wandb = '--no-wandb' not in sys.argv
+    
+    # Configuration - all hardcoded
+    dataset_path = Path('../lean-knk/data/n_2.jsonl')
+    
+    # Check if dataset exists
+    if not dataset_path.exists():
+        print(f"❌ Dataset not found at {dataset_path}")
+        print("\nTo generate the dataset:")
+        print("  cd ../lean-knk")
+        print("  lake exe knk --n 2 --count 100000 --out n_2")
+        print("\nOr for a quick test:")
+        print("  bash generate_test_data.sh")
+        
+        # Try test dataset
+        test_path = Path('../lean-knk/data/n_2_test.jsonl')
+        if test_path.exists():
+            print(f"\n✅ Found test dataset at {test_path}")
+            print("Using test dataset instead...")
+            dataset_path = test_path
+        else:
+            return
+    
+    max_length = 256  # Most puzzles are < 200 tokens
+    batch_size = 64   # Reduced for smaller GPUs
+    learning_rate = 3e-4
+    n_epochs = 20     # Reduced for testing
+    
+    # Smaller model for testing (GPT-2 small size)
+    n_layer = 6
+    n_head = 8
+    n_embd = 512
     
     # Training configuration
     checkpoint_path = 'knk_model.pt'
     wandb_project = 'knk-transformer'
     wandb_run_name = 'knk-n2'
-    use_wandb = True  # Set to False to disable wandb
     
     # Initialize wandb
     if use_wandb:
