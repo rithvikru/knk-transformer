@@ -169,33 +169,15 @@ def main():
     # Configuration - all hardcoded
     dataset_path = Path('data/n_2.jsonl')
     
-    # Check if dataset exists
-    if not dataset_path.exists():
-        print(f"❌ Dataset not found at {dataset_path}")
-        print("\nTo generate the dataset:")
-        print("  cd ../lean-knk")
-        print("  lake exe knk --n 2 --count 100000 --out n_2")
-        print("\nOr for a quick test:")
-        print("  bash generate_test_data.sh")
-        
-        # Try test dataset
-        test_path = Path('../lean-knk/data/n_2_test.jsonl')
-        if test_path.exists():
-            print(f"\n✅ Found test dataset at {test_path}")
-            print("Using test dataset instead...")
-            dataset_path = test_path
-        else:
-            return
-    
     max_length = 256  # Most puzzles are < 200 tokens
-    batch_size = 128   # Reduced for smaller GPUs
-    learning_rate = 3e-4
-    n_epochs = 50     # Reduced for testing
+    batch_size = 256   # Reduced for smaller GPUs
+    learning_rate = 1e-4
+    n_epochs = 10     # Reduced for testing
     
     # Smaller model for testing (GPT-2 small size)
-    n_layer = 12
-    n_head = 12
-    n_embd = 768
+    n_layer = 8
+    n_head = 8
+    n_embd = 512
     
     # Training configuration
     checkpoint_path = 'knk_model.pt'
@@ -213,7 +195,7 @@ def main():
                 'batch_size': batch_size,
                 'learning_rate': learning_rate,
                 'n_epochs': n_epochs,
-                'n_layer': n_layer,
+                'n_layer': n_layer, 
                 'n_head': n_head,
                 'n_embd': n_embd,
                 'vocab_size': len(token_to_id),
