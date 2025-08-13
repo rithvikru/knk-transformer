@@ -167,7 +167,7 @@ def main():
     use_wandb = '--no-wandb' not in sys.argv
     
     # Configuration - all hardcoded
-    dataset_path = Path('../lean-knk/data/n_2.jsonl')
+    dataset_path = Path('data/n_2.jsonl')
     
     # Check if dataset exists
     if not dataset_path.exists():
@@ -188,14 +188,14 @@ def main():
             return
     
     max_length = 256  # Most puzzles are < 200 tokens
-    batch_size = 64   # Reduced for smaller GPUs
+    batch_size = 128   # Reduced for smaller GPUs
     learning_rate = 3e-4
-    n_epochs = 20     # Reduced for testing
+    n_epochs = 50     # Reduced for testing
     
     # Smaller model for testing (GPT-2 small size)
-    n_layer = 6
-    n_head = 8
-    n_embd = 512
+    n_layer = 12
+    n_head = 12
+    n_embd = 768
     
     # Training configuration
     checkpoint_path = 'knk_model.pt'
