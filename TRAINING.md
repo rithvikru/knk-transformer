@@ -56,3 +56,4 @@ Edit `knkgpt.py` to change:
 - **Small** (default): 6 layers, 8 heads, 512 dim (~25M params)
 - **Medium**: 12 layers, 12 heads, 768 dim (~124M params)
 - **Large**: 24 layers, 16 heads, 1024 dim (~354M params)
+
