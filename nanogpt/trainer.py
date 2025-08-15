@@ -206,7 +206,11 @@ class Trainer:
 
                     if config.lr_decay:
                         pad_id = getattr(raw_model, 'pad_token_id', 0)
-                        self.tokens += (y != pad_id).sum().item()
+                        # count non-PAD tokens per micro-iteration;
+                        # over an optimizer step this sums to (accum_steps * micro_tokens),
+                        # which matches how warmup/final were computed.
+                        micro_tokens = (y != pad_id).sum().item()
+                        self.tokens += micro_tokens
                         if self.tokens < config.warmup_tokens:
                             lr_mult = float(self.tokens) / float(max(1, config.warmup_tokens))
                         else:
