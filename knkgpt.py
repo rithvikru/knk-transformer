@@ -5,6 +5,7 @@ import random
 import sys
 from pathlib import Path
 from array import array
+import time
 
 import numpy as np
 import torch
@@ -32,25 +33,50 @@ class KNKDataset(Dataset):
         self.split = split
         self.seed = seed
         rng = random.Random(seed)
+        self._fh = None  # lazily-opened file handle per worker/process
 
         # Build or load line offset index (memory-efficient, cached on disk)
         idx_path = str(jsonl_path) + '.idx'
         self.offsets: array
-        if os.path.exists(idx_path):
-            print(f"Loading index from {idx_path}")
-            self.offsets = array('Q')
-            with open(idx_path, 'rb') as idxf:
-                self.offsets.frombytes(idxf.read())
-        else:
-            print(f"Indexing dataset from {jsonl_path} (one-time; writes {idx_path})")
-            self.offsets = array('Q')
-            with open(jsonl_path, 'rb') as f, open(idx_path, 'wb') as idxf:
-                offset = 0
-                for line in f:
-                    if line.strip():
-                        self.offsets.append(offset)
-                    offset += len(line)
-                idxf.write(self.offsets.tobytes())
+
+        def idx_is_valid(path: str) -> bool:
+            try:
+                return os.path.exists(path) and os.path.getsize(path) > 0
+            except Exception:
+                return False
+
+        rank_env = int(os.environ.get('RANK', '0'))
+        world_size_env = int(os.environ.get('WORLD_SIZE', '1'))
+
+        if not idx_is_valid(idx_path):
+            if rank_env == 0:
+                print(f"Indexing dataset from {jsonl_path} (one-time; writes {idx_path})")
+                self.offsets = array('Q')
+                tmp_path = idx_path + '.tmp'
+                with open(jsonl_path, 'rb') as f, open(tmp_path, 'wb') as idxf:
+                    offset = 0
+                    for line in f:
+                        if line.strip():
+                            self.offsets.append(offset)
+                        offset += len(line)
+                    idxf.write(self.offsets.tobytes())
+                    idxf.flush()
+                    os.fsync(idxf.fileno())
+                os.replace(tmp_path, idx_path)
+            else:
+                # Wait for rank 0 to build the index
+                print(f"Waiting for index {idx_path} to be built by rank 0...")
+                patience_sec = 3600
+                start = time.time()
+                while not idx_is_valid(idx_path) and (time.time() - start) < patience_sec:
+                    time.sleep(1)
+                if not idx_is_valid(idx_path):
+                    raise RuntimeError(f"Timeout waiting for index file {idx_path}")
+
+        print(f"Loading index from {idx_path}")
+        self.offsets = array('Q')
+        with open(idx_path, 'rb') as idxf:
+            self.offsets.frombytes(idxf.read())
 
         n_total = len(self.offsets)
         n_train = int(n_total * train_ratio)
@@ -71,9 +97,10 @@ class KNKDataset(Dataset):
 
     def __getitem__(self, idx):
         line_idx = self.indices[idx]
-        with open(self.jsonl_path, 'rb') as f:
-            f.seek(self.offsets[line_idx])
-            raw = f.readline().decode('utf-8')
+        if self._fh is None:
+            self._fh = open(self.jsonl_path, 'rb', buffering=0)
+        self._fh.seek(self.offsets[line_idx])
+        raw = self._fh.readline().decode('utf-8')
 
         entry = json.loads(raw)
         puzzle = entry['puzzle']
@@ -93,6 +120,109 @@ class KNKDataset(Dataset):
         y = torch.tensor(input_tokens[1:], dtype=torch.long)
         return x, y
 
+    def __del__(self):
+        try:
+            if getattr(self, '_fh', None) is not None:
+                self._fh.close()
+        except Exception:
+            pass
+
+
+class PreTokenizedDataset(Dataset):
+    """Memory-mapped pretokenized dataset (uint16 token stream + offsets).
+
+    Files:
+      - <jsonl>.tok.bin : concatenated uint16 token ids
+      - <jsonl>.tok.idx : array('Q') of offsets length N+1
+    """
+
+    def __init__(self, tok_bin_path: str, tok_idx_path: str, max_length: int, split: str = 'train', train_ratio: float = 0.99, val_size: int = 200_000, seed: int = 42):
+        self.max_length = max_length
+        self.block_size = max_length - 1
+        self.tok_bin_path = tok_bin_path
+        self.tok_idx_path = tok_idx_path
+        rng = random.Random(seed)
+
+        # load offsets
+        self.offsets = array('Q')
+        with open(tok_idx_path, 'rb') as f:
+            self.offsets.frombytes(f.read())
+        self.n_samples = len(self.offsets) - 1
+
+        # memmap tokens
+        self.tokens = np.memmap(tok_bin_path, mode='r', dtype=np.uint16)
+
+        n_train = int(self.n_samples * train_ratio)
+        if split == 'train':
+            self.indices = list(range(0, n_train))
+        else:
+            val_indices = list(range(n_train, self.n_samples))
+            if len(val_indices) > val_size:
+                val_indices = rng.sample(val_indices, val_size)
+            self.indices = sorted(val_indices)
+
+        print(f"Pretokenized {split} examples: {len(self.indices)} of {self.n_samples} total")
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        i = self.indices[idx]
+        start = self.offsets[i]
+        end = self.offsets[i + 1]
+        seq = self.tokens[start:end]
+        # Pad/truncate to max_length
+        if len(seq) > self.max_length:
+            seq = seq[:self.max_length]
+        else:
+            pad_len = self.max_length - len(seq)
+            if pad_len:
+                seq = np.pad(seq, (0, pad_len), constant_values=token_to_id['<PAD>'])
+        # Autoregressive x/y shift
+        x = torch.tensor(seq[:-1], dtype=torch.long)
+        y = torch.tensor(seq[1:], dtype=torch.long)
+        return x, y
+
+
+def build_pretokenized(jsonl_path: str, tok_bin_path: str, tok_idx_path: str):
+    """One-time pretokenization: JSONL -> uint16 token stream + offsets.
+
+    The output consists of variable-length sequences; BOS/SEP/EOS are embedded.
+    """
+    print(f"Pretokenizing {jsonl_path} -> {tok_bin_path}, {tok_idx_path}")
+    offsets = array('Q')
+    offsets.append(0)
+    total = 0
+    tmp_bin = tok_bin_path + '.tmp'
+    with open(jsonl_path, 'r', encoding='utf-8') as fin, open(tmp_bin, 'wb') as fb:
+        for line_num, line in enumerate(fin, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                puzzle = entry['puzzle']
+                solution = entry['solution']
+            except Exception:
+                continue
+            seq = [token_to_id['<BOS>']] + encode(puzzle) + [token_to_id['<SEP>']] + encode(solution) + [token_to_id['<EOS>']]
+            arr = array('H', seq)  # uint16
+            fb.write(arr.tobytes())
+            total += len(seq)
+            offsets.append(total)
+            if (line_num % 1_000_000) == 0:
+                print(f"  processed {line_num:,} lines...")
+
+    # write idx atomically
+    tmp_idx = tok_idx_path + '.tmp'
+    with open(tmp_idx, 'wb') as fi:
+        fi.write(offsets.tobytes())
+        fi.flush()
+        os.fsync(fi.fileno())
+    os.replace(tmp_idx, tok_idx_path)
+    os.replace(tmp_bin, tok_bin_path)
+    print(f"Pretokenized {len(offsets)-1:,} samples; total tokens: {total:,}")
+
 
 def main():
     # CLI flag to disable wandb quickly
@@ -110,10 +240,21 @@ def main():
     n_head = 8
     n_embd = 512
 
-    # Build datasets
-    print(f"Preparing datasets from {dataset_path}")
-    train_dataset = KNKDataset(dataset_path, max_length=max_length, split='train')
-    val_dataset = KNKDataset(dataset_path, max_length=max_length, split='val')
+    # Build or load pretokenized dataset
+    tok_bin = str(dataset_path) + '.tok.bin'
+    tok_idx = str(dataset_path) + '.tok.idx'
+    rank_env = int(os.environ.get('RANK', '0'))
+    if not (os.path.exists(tok_bin) and os.path.exists(tok_idx)):
+        if rank_env == 0:
+            build_pretokenized(str(dataset_path), tok_bin, tok_idx)
+        else:
+            print(f"Waiting for pretokenized files to be built by rank 0...")
+            while not (os.path.exists(tok_bin) and os.path.exists(tok_idx)):
+                time.sleep(5)
+
+    print(f"Preparing datasets from {dataset_path} (pretokenized)")
+    train_dataset = PreTokenizedDataset(tok_bin, tok_idx, max_length=max_length, split='train')
+    val_dataset = PreTokenizedDataset(tok_bin, tok_idx, max_length=max_length, split='val')
 
     # Model configuration
     model_config = GPTConfig(
@@ -180,7 +321,7 @@ def main():
         lr_decay=True,
         warmup_tokens=warmup_tokens,
         final_tokens=final_tokens,
-        num_workers=16,
+    num_workers=64,
         persistent_workers=True,
         prefetch_factor=4,
         pin_memory=True,

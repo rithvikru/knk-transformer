@@ -93,7 +93,11 @@ class Trainer:
 
         # precision/amp
         self.amp_dtype = torch.bfloat16 if getattr(self.config, 'use_bf16', True) and torch.cuda.is_available() else (torch.float16 if getattr(self.config, 'use_fp16', False) else None)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.amp_dtype == torch.float16))
+        # Use new torch.amp API to avoid deprecation warnings
+        try:
+            self.scaler = torch.amp.GradScaler(device='cuda', enabled=(self.amp_dtype == torch.float16))
+        except Exception:
+            self.scaler = torch.cuda.amp.GradScaler(enabled=(self.amp_dtype == torch.float16))
 
     def save_checkpoint(self):
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
@@ -214,7 +218,8 @@ class Trainer:
                     else:
                         lr = config.learning_rate
 
-                    if self.use_wandb and (it % getattr(config, 'log_interval', 10) == 0):
+                    # lighter-weight logging progress to reduce overhead
+                    if self.use_wandb and (it % getattr(config, 'log_interval', 50) == 0):
                         try:
                             # handle grad_norm which may be a tensor
                             grad_norm_value = float(grad_norm) if 'grad_norm' in locals() and hasattr(grad_norm, '__float__') else float(getattr(locals().get('grad_norm', 0.0), 'item', lambda: 0.0)())
@@ -225,11 +230,13 @@ class Trainer:
                                 'train/iter': epoch * len(loader) + it,
                                 'train/grad_norm': grad_norm_value,
                                 'train/tokens': int(self.tokens) if hasattr(self, 'tokens') else 0,
+                                'train/world_size': int(self.world_size),
+                                'train/accum': int(getattr(self.config, 'grad_accum_steps', 1)),
                             })
                         except Exception:
                             pass
 
-                    if self.rank == 0 and 'tqdm' in str(type(iterator)):
+                    if self.rank == 0 and 'tqdm' in str(type(iterator)) and (it % 50 == 0):
                         iterator.set_description(f"epoch {epoch+1} iter {it}: train loss {loss.item():.5f}. lr {lr:e}")
 
                 if (not is_train) and (max_val_batches is not None) and (it + 1 >= max_val_batches):
