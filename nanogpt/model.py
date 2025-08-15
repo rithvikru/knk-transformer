@@ -15,6 +15,9 @@ class GPTConfig:
     def __init__(self, vocab_size, block_size, **kwargs):
         self.vocab_size = vocab_size
         self.block_size = block_size
+        # Allow model/loss behavior to be configured from outside
+        # pad_token_id is used to mask loss on padding positions
+        self.pad_token_id = kwargs.pop('pad_token_id', 0)
         for k,v in kwargs.items():
             setattr(self, k, v)
 
@@ -73,7 +76,8 @@ class Block(nn.Module):
         )
 
     def forward(self, x, return_att=False, only_last=-1):
-        updt, att = self.attn(self.ln1(x), only_last)
+        # explicitly pass only_last as a keyword argument to avoid misplacing layer_past
+        updt, att = self.attn(self.ln1(x), only_last=only_last)
         x = x + updt
         x = x + self.mlp(self.ln2(x))
         if return_att:
@@ -84,6 +88,9 @@ class Block(nn.Module):
 class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
+
+        # expose pad token id for loss masking and token accounting
+        self.pad_token_id = getattr(config, 'pad_token_id', 0)
 
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
         self.pos_emb = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd))
@@ -156,7 +163,12 @@ class GPT(nn.Module):
         logits = self.head(x)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=0)
+            # ignore padding index for loss computation
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=getattr(self, 'pad_token_id', 0)
+            )
         return logits, loss
     
     @torch.no_grad()
