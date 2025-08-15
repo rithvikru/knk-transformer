@@ -148,6 +148,9 @@ class Trainer:
             sampler = None
             if self.is_distributed and hasattr(data, '__len__'):
                 sampler = DistributedSampler(data, shuffle=is_train)
+                if is_train and hasattr(sampler, 'set_epoch'):
+                    # ensure different shuffles each epoch across ranks
+                    sampler.set_epoch(epoch)
             loader = DataLoader(
                 data,
                 shuffle=(sampler is None and is_train),

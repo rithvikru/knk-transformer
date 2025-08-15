@@ -102,7 +102,8 @@ def main():
     dataset_path = Path('data/n_2.jsonl')
     max_length = 256
     learning_rate = 3e-4
-    n_epochs = 2
+    # With massive data, one pass is sufficient with a token-based schedule
+    n_epochs = 1
 
     # Model size
     n_layer = 8
@@ -146,10 +147,18 @@ def main():
             print(f"Warning: failed to load checkpoint {ckpt}: {e}")
 
     # Scheduler tokens
-    # With DDP + grad accumulation, we count tokens via trainer; provide a target token budget
-    approx_tokens_per_sample = max_length - 1
-    warmup_tokens = int(2e9)  # aggressive warmup with massive compute
-    final_tokens = int(2e12)  # target total tokens for cosine schedule plateau
+    # Compute per-rank token budgets tied to planned run length
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    micro_bs = 64  # keep in sync with TrainerConfig below
+    accum_steps = 8  # target accumulation below
+    tokens_per_seq = max_length - 1
+    per_rank_tokens_per_step = micro_bs * tokens_per_seq * accum_steps
+    global_batch = world_size * micro_bs * accum_steps
+    steps_per_epoch = max(1, len(train_dataset) // global_batch)
+    planned_tokens_per_rank = per_rank_tokens_per_step * steps_per_epoch * n_epochs
+    warmup_tokens = max(int(0.02 * planned_tokens_per_rank), per_rank_tokens_per_step * 1500)
+    warmup_tokens = min(warmup_tokens, max(per_rank_tokens_per_step, planned_tokens_per_rank // 3))
+    final_tokens = max(per_rank_tokens_per_step, planned_tokens_per_rank)
 
     # Set seeds for reproducibility
     seed = 1337
@@ -161,12 +170,11 @@ def main():
 
     # Trainer configuration
     # Training configuration
-    world_size = int(os.environ.get('WORLD_SIZE', '1'))
     # Use micro-batches per GPU + grad accumulation to reach a large global batch
     train_config = TrainerConfig(
         max_epochs=n_epochs,
-        micro_batch_size=64,  # per-GPU micro batch, adjust based on memory
-        global_batch_size= world_size * 64 * 8,  # target large global batch (8 accumulation steps)
+        micro_batch_size=micro_bs,  # per-GPU micro batch, adjust based on memory
+        global_batch_size= world_size * micro_bs * accum_steps,  # target large global batch
         learning_rate=learning_rate,
         betas=(0.9, 0.95),
         lr_decay=True,
